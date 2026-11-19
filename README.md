@@ -23,6 +23,8 @@
 
 ## 课程来源
 
+> 📚 **想看教程原文？点这里**：教程原文站 https://didilili.github.io/ai-agents-from-zero/ ｜ 源码仓库 https://github.com/didilili/ai-agents-from-zero
+
 - **大纲与知识点**：开源仓库 [didilili/ai-agents-from-zero](https://github.com/didilili/ai-agents-from-zero)（2026 最系统的 AI Agent 速成指南，覆盖 LangChain / LangGraph / Coze / Dify / MCP / RAG / 提示词）
 - **生成思路**：按《学会自学》的自学方法论设计——四阶段递进、三层笔记强制输出、自测验收、周复盘
 - **正文**：由 AI 在上述大纲基础上撰写（约 8.4 万字，不逐字翻译），API 与代码细节对照官方文档（OpenAI / Anthropic / MCP 规范 / LangChain / Coze / Dify）以保证准确；详见使用手册「课程来源与生成思路」
