@@ -1,0 +1,203 @@
+# AI 智能体学习进度台
+
+**能真的用它学东西**的学习平台：14 个单元的内置课程正文（机制拆解 + 动手步骤 + 踩坑清单 + 自测题 + 追问答案 + 三级提示），
+学完就自动变成进度，配上四阶段任务、三层笔记、卡点拆解队列和自动周复盘。
+电脑和手机打开同一个网址、输同一组「昵称 + 4 位 PIN」，看到的就是同一份进度。
+
+> **关于后端**：原计划用 WorkBuddy 云服务托管的数据库，但开通确认在本次会话里连续多次被平台自动关闭，环境始终没能建起来。
+> 因此后端改为**自建 Node 服务**（零第三方依赖），数据落在服务端磁盘的 JSON 文件里。
+> 功能上完全满足需求，代价是：**重新发布会重置服务器文件系统**，重要数据请用应用内「导出备份」留存。
+> 若以后云服务能开通，前端只需把 `js/api.js` 里的 `request()` 换成云端 SDK，页面层不用动。
+
+---
+
+## 一、文件结构
+
+```
+index.html              单页外壳（登录 + 5 个视图 + 阅读器容器）
+css/app.css             全部样式：亮色设计系统（默认亮色，顶栏可手动切暗色，不随系统）
+js/api.js               数据访问层（auth / curriculum / tasks / notes / checkins / stuck / dashboard）
+js/app.js               界面与交互（含课程列表、阅读器、自测判分、分级提示）
+content/                课程正文（14 个单元，纯数据，无依赖）
+  index.js                汇总 + 四阶段定义 + 案例单元标记
+  stage1.js  L1–L4        筛信息
+  stage2.js  L5–L7        拆问题
+  stage3.js  L8–L10       讲清楚（要求出笔记）
+  stage4.js  L11–L14      用出来
+server.js               后端：静态文件 + /api/* 接口 + JSON 文件存储 + 学完判定
+tools/verify.js         交付前自检（含 --negative 反向验证）
+tools/preview.html      开发期多屏截图预演（手机/桌面并排；?one= 单帧纯净输出）
+tools/overflow-check.html  横向溢出自动巡检（6 种宽度 × 6 个页面）
+tools/shots-check.html  截图目标页核对（关键元素存在 + 不溢出，--dump-dom 读结果，不需人眼）
+tools/theme-check.html  主题系统核对（默认亮色/记忆暗色/一键切回/theme-color 跟随）
+tools/probe-flow.js     真实浏览器点击流探针（Playwright 驱动 Edge：登录→下一步→阅读器→迁移→答题全流程）
+data/                   运行时生成（db.json、每日快照、会话密钥）——不随代码提交
+manifest.webmanifest    PWA 清单（添加到主屏幕 / 全屏）
+sw.js                   Service Worker（只缓存外壳，不缓存 /api）
+icons/                  主屏幕图标（180 / 192 / 512 / maskable）
+```
+
+前端无框架、无 npm 依赖、无构建步骤。后端只用 Node 内置模块（`http` / `crypto` / `fs`）。
+
+---
+
+## 二、课程内容（这是"能学"的部分）
+
+14 个单元，每单元固定 8 个模块，全部写在 `content/` 里，**不调用任何模型、不联网、零成本**：
+
+| 模块 | 作用 |
+|---|---|
+| `essence` 本质卡 | 一句话说清这节到底在解决什么 |
+| `why` + `metaphor` | 为什么需要它，配一个能对上结构的比喻 |
+| `points` 机制拆解 | 3–5 条，讲清内部怎么运转 |
+| `steps` 动手 | 2–4 步可直接照做的动作，多数带可复制的代码 |
+| `pitfalls` 踩坑清单 | 每个坑都配「修法」 |
+| `quiz` 自测 | 3 道单选题，带答案解析，≥80% 算过 |
+| `followups` 追问自答 | 学完一定会问的问题 + 参考答案（折叠） |
+| `hints` 三级提示 | 方向 → 步骤 → 答案，卡住时一层层揭开，不直接给答案 |
+
+**单元清单**（`[案例]` 与 `[笔记]` 来自 `content/index.js` 的 `CASE_IDS` 与各单元的 `requiresNote`）：
+
+| 阶段 | 单元 |
+|---|---|
+| 筛信息 | L1 大模型基础认知 · L2 提示词工程 · L3 Tool Calling 概念 · L4 MCP 概念 |
+| 拆问题 | L5 Coze 或 Dify 跑通第一个工作流 `[案例]` · L6 LangChain 最小对话循环 `[案例]` · L7 一个带 Memory 的案例 `[案例]` |
+| 讲清楚 | L8 三层笔记 #1：机制比喻 `[笔记]` · L9 三层笔记 #2：踩坑修法 `[笔记]` · L10 三层笔记 #3：一句话本质 `[笔记]` |
+| 用出来 | L11 选定实战项目：电商问数 或 深度研搜 · L12 跑通最小链路 `[案例]` · L13 替换成自己的数据 · L14 完成追问自答清单 |
+
+### 学完判定（只在服务端算）
+
+```
+学完 = 标记已读 && 自测最好成绩 ≥ 80 && （该单元要求笔记 ? 已有关联笔记 : 真）
+```
+
+- 判定在 `server.js` 的 `recheckLessonDone()`，前端只负责显示缺哪一项；
+- 三个条件任一满足/失效都会重新判定，**不满足时不会把你已经标 done 的任务改回去**（避免误伤手动标记）；
+- L8–L10 三个单元 `requiresNote: true`：读完、答满 100 分但没写笔记，状态仍是「进行中」并提示"还差一条笔记"；
+- 重考低分不会覆盖历史最好成绩。
+
+---
+
+## 三、接口（全部返回 JSON）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/auth/login` | `{nickname, pin}`，昵称不存在即注册；成功写 HttpOnly 会话 cookie |
+| GET | `/api/auth/me` | 当前身份，未登录 401 |
+| POST | `/api/auth/logout` | 清 cookie |
+| PATCH | `/api/user` | 改昵称（重名返回 409） |
+| GET | `/api/curriculum` | 课程正文：`{stages, lessons}`（14 个单元全文，需登录） |
+| GET/POST | `/api/tasks` | 任务列表 / 新建 |
+| PATCH/DELETE | `/api/tasks/:id` | 改状态、标题、阶段、类型 / 删除 |
+| POST | `/api/tasks/:id/progress` | 记学习进度：`{read:true}` 或 `{quizScore, quizTotal, read}`；返回 `state` 说明还差哪一项 |
+| GET/POST | `/api/notes` | 三层笔记列表 / 新建（关联任务时会触发一次学完判定） |
+| PATCH/DELETE | `/api/notes/:id` | 编辑 / 删除 |
+| GET/POST | `/api/checkins` | 打卡记录 / 打卡（同一天重复提交=覆盖） |
+| GET/POST | `/api/stuck` | 拆解队列 / 新增卡点（同时把任务置为"卡住"） |
+| PATCH/DELETE | `/api/stuck/:id` | 更新下一步 / 关闭（`status:closed`）/ 重开 |
+| GET | `/api/dashboard` | 看板 JSON：总进度、四阶段、已读单元数、自测均分、下一节、遗留旧任务数、8 周热力图、逾期卡点数、近四周复盘 |
+| POST | `/api/migrate` | 旧版数据迁移：移除没挂课程的任务，补齐缺失的 14 个课程单元任务（幂等） |
+| GET | `/api/export` | 导出当前账号全部数据（备份用） |
+| GET | `/healthz` | 存活检查 |
+
+**所有数字都由服务端 `buildDashboard()` 从库里现算**，前端不写死任何示例值。
+
+### 数据模型（`data/db.json`）
+
+```
+users[]    { id, nickname, salt, pinHash, createdAt }
+tasks[]    { id, userId, lessonId, stage, module, title, kind(task|case),
+             status(todo|doing|done|stuck), sortOrder,
+             readAt, quizBest, quizTotal, completedAt, createdAt, updatedAt }
+notes[]    { id, userId, taskId, stage, module, title, oldProblem, mechanism, pitfalls,
+             createdAt, updatedAt }
+checkins[] { id, userId, checkinDate, stage, note, createdAt }   // 同人同日唯一
+stuck[]    { id, userId, taskId, stuckText, attempts, nextStep,
+             status(open|closed), enteredAt, closedAt }
+```
+
+新账号的 14 条任务**由 `content/` 派生**（`server.js` 里 `LESSONS.map(...)`），课程改了任务标题/阶段/案例标记自动跟着变。
+每条记录都带 `userId`，所有查询与写入都按当前会话的身份过滤；越权访问别人的记录直接 404（已实测）。
+
+---
+
+## 四、部署与运行
+
+发布走 WorkBuddy 的站点托管，监听 `PORT` 环境变量、绑定 `0.0.0.0`：
+
+```bash
+node server.js          # 本地：默认 3000 端口
+PORT=5173 node server.js
+```
+
+可选环境变量：
+
+- `PORT`（默认 3000）
+- `DATA_DIR`（默认 `./data`）——想让数据落在持久盘上时指向别处
+- `SESSION_SECRET`（默认首次启动随机生成并存进 `data/.session_secret`）
+
+部署后得到形如 `https://xxx.workbuddy.link` 的网址，电脑和手机都打开它即可。
+
+---
+
+## 五、手机添加到主屏幕
+
+**iPhone / iPad（Safari）**
+1. Safari 打开网址 → 底部「分享」→「添加到主屏幕」。
+2. 从主屏幕图标启动即全屏（无地址栏），状态栏样式由 `apple-mobile-web-app-*` 决定。
+
+**Android（Chrome / Edge）**
+1. 打开网址 → 右上角「⋮」→「安装应用」/「添加到主屏幕」。
+2. 有 `manifest.webmanifest` + `sw.js`，满足安装条件。
+
+必须 HTTPS（开发时的 `http://127.0.0.1` 也能装，但手机要用正式域名）。
+
+---
+
+## 六、关键行为
+
+- **主题**：默认亮色（不随系统变暗）；顶栏太阳/月亮按钮可切暗色，选择会记住。
+- **实时落库**：勾任务、写笔记、打卡、记卡点、标记已读、提交自测，每次改动立刻 POST/PATCH 到服务端，弹「已保存」。
+  没有"手动保存"，直接关页面也不丢。
+- **学习动线**：课程 tab 点开单元 → 读正文（本质卡/机制/动手/踩坑）→ 底部「标记已读」→ 做自测 → 需出笔记的单元补一条 → 服务端自动判定「已学完」，任务状态同步变 done，看板百分比、阶段条、热力图一起动。
+- **旧版数据自愈**：账号里若有没挂课程单元的任务（旧版遗留），「下一步」会自动跳过它；
+  看板出现「导入 14 个课程单元 / 清理旧任务」入口，一键迁移（幂等，笔记/打卡/复盘保留）。
+- **跨设备同步**：切回页面（`visibilitychange`）、窗口聚焦、点右上角刷新、或每 45 秒自动拉一次；
+  弹层打开时不会打断你。手机改完，电脑刷新/切回即可见。
+- **初始模板只写一次**：新账号注册时按 `content/` 写入 14 条预置任务（含 4 个"案例"），之后你删改都不会被重置。
+- **卡点提醒**：进入队列超过 2 天未关闭，首页出现橙色提示条；队列 tab 上有数字角标。
+- **周复盘**：按自然周（周一起）统计打卡/笔记/完成任务的动作数，给出「投入最多的阶段 + 未闭环卡点 + 下周建议回到哪个阶段」，近四周都能看。
+- **备份**：复盘页「导出备份」下载完整 JSON。重新发布会清空服务器磁盘，重要进度请定期导出。
+
+---
+
+## 七、自检与验收
+
+```bash
+node tools/verify.js             # 全量自检（临时端口 + 临时数据目录，不碰正式数据；项数由脚本自己打印）
+node tools/verify.js --negative  # 反向验证：故意写错 4 处期望值，必须全部 FAIL 才算检查有效
+```
+
+自检覆盖：未登录拦截、建号与模板只写一次、课程结构与题目答案索引合法、**README 与课程内容一致**、
+只读/不及格不判定学完、满分判定学完、低分不覆盖最好成绩、要求笔记的单元缺笔记被拦、
+看板统计（已读数/自测均分/下一节）、越权访问、三层笔记、打卡覆盖、卡点流转、身份隔离、静态资源、导出备份。
+
+视觉核对用 `tools/preview.html`：先用演示账号登录，再把若干屏并排铺成 390px（或 `?w=320`）手机宽度，
+可直接用 Chrome headless 截图，参数 `?set=1..6` 切换屏组，`?scroll=1500` 指定阅读器滚动位置，`?go=dashboard` 走桌面全宽。
+
+横向溢出用 `tools/overflow-check.html` 自动巡：6 种宽度（320/360/390/414/768/1280）× 6 个页面，
+逐个量 `scrollWidth - innerWidth`，溢出就直接打印是哪个元素、超出多少像素。
+
+> **踩过的坑**：Windows 上 `chrome --headless --window-size=390,844` 并不会真的按 390px 布局
+> （窗口宽度被钳到 500px 左右，截出来的是左侧剪裁），照着它调窄屏样式会白忙。
+> 量窄屏一律用 iframe 固定宽度，别信 `--window-size`。
+
+| 验收项 | 怎么验 |
+|---|---|
+| 一个单元能真的学完 | 打开任一单元 → 标记已读 → 做自测到 ≥80% → 状态变「已学完」，看板 +1 |
+| 要求笔记的单元不会白给 | 打开 L8，读+满分但不写笔记，状态停在「进行中」；补一条关联笔记后自动变「已学完」 |
+| 电脑勾任务 → 手机一致 | 电脑把某任务点「直接完成」，手机刷新（或切回应用），状态变为完成 |
+| 手机写笔记 → 电脑可见可编辑 | 手机写一条三层笔记，电脑刷新后出现，点「⋯」可改 |
+| 看板随任务变化 | 完成/撤销任意任务，总进度百分比、对应阶段条、今日热力图同时变化 |
+| 卡点进队列并可处理 | 任务点「卡住」填卡点 → 队列出现并带天数；点「已解决」选择去向 → 移入"最近关闭" |
+| 身份隔离 | 换个昵称+PIN 登录，看不到别人的任务和笔记 |

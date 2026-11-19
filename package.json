@@ -1,0 +1,14 @@
+{
+  "name": "agent-learning-progress",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI 智能体学习进度台 — 四阶段任务 / 三层笔记 / 卡点队列 / 周复盘",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

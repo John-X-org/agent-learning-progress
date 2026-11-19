@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>AI 智能体学习进度台</title>
+<meta name="description" content="带课程内容的 AI 智能体学习台：14 个单元，读完、动手、自测、写笔记，卡住有分级提示。" />
+<meta name="theme-color" content="#f5f7fb" id="metaTheme" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="学习进度台" />
+<script>
+  // 主题：默认亮色；用户手动切过暗色才用暗色。在样式表加载前执行，避免闪白。
+  (function () {
+    var t = 'light';
+    try { var v = localStorage.getItem('alp-theme'); if (v === 'dark' || v === 'light') t = v; } catch (e) { /* ignore */ }
+    if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+  })();
+</script>
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icons/icon-180.png" />
+<link rel="icon" href="icons/icon-192.png" />
+<link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+
+<!-- ============ 登录 ============ -->
+<div id="loginView" class="login">
+  <button id="btnThemeLogin" class="icon-btn login-theme" type="button" aria-label="切换深浅色"></button>
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-mark">AI</div>
+      <div>
+        <h1>AI 智能体学习进度台</h1>
+        <p class="muted">14 个单元 · 读完就练 · 卡住有提示</p>
+      </div>
+    </div>
+
+    <div class="login-body">
+      <div id="loginLoading" class="login-block" hidden>
+        <p class="muted">正在连接服务器…</p>
+      </div>
+
+      <div id="loginPanel" class="login-block">
+        <label class="field">
+          <span class="field-label">昵称</span>
+          <input id="loginNick" type="text" maxlength="20" autocomplete="username" placeholder="给自己起个名字，例如：老大" />
+        </label>
+        <label class="field">
+          <span class="field-label">4 位 PIN</span>
+          <input id="loginPin" type="text" inputmode="numeric" maxlength="4" autocomplete="current-password" placeholder="4 位数字" />
+        </label>
+        <button id="btnLogin" class="btn btn-primary btn-lg" type="button">进入</button>
+        <p class="hint">
+          第一次输入某个「昵称 + PIN」就是注册；之后在任何设备上输入同一组，看到的就是同一份进度。
+          PIN 只用来区分身份，别用银行卡之类的密码。
+        </p>
+        <p id="loginError" class="error" role="alert" hidden></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 应用 ============ -->
+<div id="appView" class="app" hidden>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="dot" id="syncDot" title="连接状态"></span>
+      <strong>学习进度台</strong>
+    </div>
+    <div class="topbar-right">
+      <span id="userChip" class="chip-btn" title="账号"></span>
+      <button id="btnTheme" class="icon-btn" type="button" aria-label="切换深浅色"></button>
+      <button id="btnRefresh" class="icon-btn" type="button" aria-label="刷新">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H4a8 8 0 1 0 8-8z" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- 看板 -->
+    <section class="view" data-view="dashboard">
+      <div class="card total-card">
+        <div class="total-ring">
+          <svg viewBox="0 0 120 120" class="ring" aria-hidden="true">
+            <defs>
+              <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#4353d9" />
+                <stop offset="1" stop-color="#8b5cf6" />
+              </linearGradient>
+            </defs>
+            <circle cx="60" cy="60" r="52" class="ring-bg"></circle>
+            <circle cx="60" cy="60" r="52" class="ring-fg" id="ringFg"></circle>
+          </svg>
+          <div class="ring-label">
+            <b id="totalPct">0%</b>
+            <span class="muted">学完比例</span>
+          </div>
+        </div>
+        <div class="total-stats">
+          <div class="stat">
+            <b id="kpDone">0/0</b>
+            <span class="muted">单元学完</span>
+          </div>
+          <div class="stat">
+            <b id="caseDone">0/0</b>
+            <span class="muted">案例跑通</span>
+          </div>
+          <div class="stat">
+            <b id="quizAvg">—</b>
+            <span class="muted">自测均分</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="nextCard"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>四阶段</h2>
+          <span class="muted small" id="stageSummary"></span>
+        </div>
+        <div id="stageBars" class="stage-bars"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>学习热力图</h2>
+          <span class="muted small">近 8 周</span>
+        </div>
+        <div id="heatmap" class="heatmap"></div>
+        <div class="heat-legend">
+          <span class="muted small">少</span>
+          <i class="heat-cell l0"></i><i class="heat-cell l1"></i><i class="heat-cell l2"></i><i class="heat-cell l3"></i><i class="heat-cell l4"></i>
+          <span class="muted small">多</span>
+        </div>
+      </div>
+
+      <div id="stuckAlert" class="alert" hidden></div>
+
+      <div class="card quick-card">
+        <button id="btnCheckin" class="btn btn-primary btn-lg" type="button">今日打卡</button>
+        <div id="checkinStatus" class="muted small"></div>
+      </div>
+    </section>
+
+    <!-- 课程 -->
+    <section class="view" data-view="courses" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>学习路线</h2>
+          <span class="muted small" id="courseMeta"></span>
+        </div>
+        <p class="muted small">按顺序学。每单元：读 → 动手 → 自测 ≥80 分 → 写笔记（部分单元必须），三项齐了才算学完。</p>
+      </div>
+      <div id="courseList" class="list"></div>
+    </section>
+
+    <!-- 笔记 -->
+    <section class="view" data-view="notes" hidden>
+      <div class="toolbar">
+        <input id="noteSearch" class="grow" type="search" placeholder="搜索笔记关键词…" />
+        <button id="btnAddNote" class="btn btn-ghost" type="button">+ 笔记</button>
+      </div>
+      <div class="toolbar">
+        <div class="segmented" id="noteFilter">
+          <button class="seg active" data-stage="all" type="button">全部</button>
+          <button class="seg" data-stage="filter" type="button">筛信息</button>
+          <button class="seg" data-stage="decompose" type="button">拆问题</button>
+          <button class="seg" data-stage="explain" type="button">讲清楚</button>
+          <button class="seg" data-stage="apply" type="button">用出来</button>
+        </div>
+      </div>
+      <div id="noteList" class="list"></div>
+    </section>
+
+    <!-- 队列 -->
+    <section class="view" data-view="queue" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>拆解队列</h2>
+          <span class="muted small" id="queueMeta"></span>
+        </div>
+        <p class="muted small">每个卡点必须落到一个"下一步最小尝试"，否则它只是情绪。</p>
+      </div>
+      <div id="queueList" class="list"></div>
+    </section>
+
+    <!-- 复盘 -->
+    <section class="view" data-view="review" hidden>
+      <div id="reviewList" class="list"></div>
+      <div class="card">
+        <div class="card-head"><h2>账号</h2></div>
+        <div id="accountBox" class="account-box"></div>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabbar" id="tabbar">
+    <button class="tab active" data-target="dashboard" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" fill="currentColor"/></svg>
+      <span>看板</span>
+    </button>
+    <button class="tab" data-target="courses" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v16H4zm9 0h7v16h-7z" fill="currentColor"/></svg>
+      <span>课程</span>
+    </button>
+    <button class="tab" data-target="notes" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v2H4zm0 5h16v2H4zm0 5h10v2H4zm0 5h10v2H4z" fill="currentColor"/></svg>
+      <span>笔记</span>
+    </button>
+    <button class="tab" data-target="queue" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 1 21h22L12 2zm1 14h-2v2h2v-2zm0-6h-2v4h2v-4z" fill="currentColor"/></svg>
+      <span>队列<i id="queueBadge" class="badge" hidden></i></span>
+    </button>
+    <button class="tab" data-target="review" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8v4l5-4-5-4v2z" fill="currentColor"/></svg>
+      <span>复盘</span>
+    </button>
+  </nav>
+</div>
+
+<!-- 单元阅读器 -->
+<div id="readerRoot"></div>
+<div id="modalRoot"></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="js/api.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

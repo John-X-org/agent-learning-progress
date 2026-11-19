@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>theme-check</title>
+<style>body{margin:0;font:13px/1.6 ui-monospace,Consolas,monospace;background:#fff;color:#111}pre{white-space:pre-wrap;padding:12px}</style></head>
+<body>
+<pre id="out">检查中…</pre>
+<script>
+  // 验证主题系统：默认亮色、可切暗色、meta theme-color 跟随、无系统跟随
+  const out = document.getElementById('out');
+  const lines = [];
+
+  function bg(win, doc) {
+    return win.getComputedStyle(doc.body).backgroundColor;
+  }
+
+  function loadFrame() {
+    return new Promise(function (resolve) {
+      const f = document.createElement('iframe');
+      f.style.cssText = 'position:absolute;left:-9999px;top:0;width:390px;height:700px;border:0';
+      f.src = '/?themecheck=' + Date.now();
+      f.addEventListener('load', function () {
+        setTimeout(function () { resolve(f); }, 800);
+      });
+      document.body.appendChild(f);
+    });
+  }
+
+  (async function () {
+    // 1) 默认（无任何存储）应为亮色
+    let f = await loadFrame();
+    const w = f.contentWindow, d = f.contentDocument;
+    const light = bg(w, d);
+    lines.push((light === 'rgb(245, 247, 251)' ? 'PASS' : 'FAIL') + ' 默认亮色 body 背景 = ' + light);
+    const meta = d.querySelector('meta[name="theme-color"]');
+    lines.push((meta && meta.content === '#f5f7fb' ? 'PASS' : 'FAIL') + ' 默认 meta theme-color = ' + (meta && meta.content));
+    // 暗色不应随系统：无 data-theme 属性且 headless 默认浅色 → 无 [data-theme=dark]
+    lines.push((d.documentElement.getAttribute('data-theme') !== 'dark' ? 'PASS' : 'FAIL') + ' 默认不是暗色');
+
+    // 2) 写入 localStorage 后刷新 → 暗色
+    try { w.localStorage.setItem('alp-theme', 'dark'); } catch (e) { /* ignore */ }
+    f.remove();
+    f = await loadFrame();
+    const w2 = f.contentWindow, d2 = f.contentDocument;
+    const dark = bg(w2, d2);
+    lines.push((dark === 'rgb(15, 18, 25)' ? 'PASS' : 'FAIL') + ' 记忆暗色后 body 背景 = ' + dark);
+    const meta2 = d2.querySelector('meta[name="theme-color"]');
+    lines.push((meta2 && meta2.content === '#0f1219' ? 'PASS' : 'FAIL') + ' 暗色 meta theme-color = ' + (meta2 && meta2.content));
+
+    // 3) 顶栏主题按钮存在且点了会切回亮色
+    const btn = d2.getElementById('btnThemeLogin');
+    lines.push((!!btn ? 'PASS' : 'FAIL') + ' 登录页有主题切换按钮');
+    btn.click();
+    await new Promise(function (r) { setTimeout(r, 300); });
+    const back = bg(w2, d2);
+    lines.push((back === 'rgb(245, 247, 251)' ? 'PASS' : 'FAIL') + ' 点按钮切回亮色 = ' + back);
+
+    // 4) 清掉存储，恢复默认
+    try { w2.localStorage.removeItem('alp-theme'); } catch (e) { /* ignore */ }
+    f.remove();
+
+    let bad = 0;
+    lines.forEach(function (l) { if (l.indexOf('FAIL') === 0) bad++; });
+    lines.unshift(bad === 0 ? 'ALL-PASS 共 ' + lines.length + ' 项' : 'HAS-FAIL ' + bad);
+    out.textContent = lines.join('\n');
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>横向溢出巡检</title>
+<style>
+  body { margin:0; font:13px/1.55 ui-monospace, Consolas, monospace; background:#fff; color:#111; }
+  pre { white-space:pre-wrap; padding:12px; margin:0; }
+  .ok { color:#0a7; } .bad { color:#c00; font-weight:700; }
+</style></head>
+<body>
+<pre id="out">巡检中…（每种宽度 × 每个页面，检查是否出现横向溢出）</pre>
+<script>
+  // 说明：Chrome headless 在 Windows 上会把窗口宽度钳到 500px 以上，
+  // 所以不能靠 --window-size 量窄屏，必须用 iframe 精确设定宽度。
+  const WIDTHS = [320, 360, 390, 414, 768, 1280];
+  const PAGES = [
+    ['看板', '#dashboard'],
+    ['课程', '#courses'],
+    ['笔记', '#notes'],
+    ['队列', '#queue'],
+    ['复盘', '#review'],
+    ['阅读器', '#lesson/L8']
+  ];
+
+  const out = document.getElementById('out');
+  const lines = [];
+
+  function esc(s) { return String(s).replace(/[<>&]/g, function (c) { return '&' + (c === '<' ? 'lt' : c === '>' ? 'gt' : 'amp') + ';'; }); }
+
+  function probe(width, hash) {
+    return new Promise(function (resolve) {
+      const f = document.createElement('iframe');
+      f.style.cssText = 'position:absolute;left:-9999px;top:0;width:' + width + 'px;height:820px;border:0';
+      f.src = '/?probe=1' + hash;
+      f.addEventListener('load', function () {
+        setTimeout(function () {
+          let res = { overflow: 0, culprits: [] };
+          try {
+            const w = f.contentWindow, d = f.contentDocument;
+            const iw = w.innerWidth;
+            res.overflow = d.documentElement.scrollWidth - iw;
+            if (res.overflow > 1) {
+              Array.prototype.forEach.call(d.querySelectorAll('body *'), function (el) {
+                const r = el.getBoundingClientRect();
+                if (r.width && r.right > iw + 1 && res.culprits.length < 4) {
+                  res.culprits.push(el.tagName.toLowerCase() +
+                    (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).join('.') : '') +
+                    ' right=' + Math.round(r.right));
+                }
+              });
+            }
+          } catch (e) { res.error = e.message; }
+          f.remove();
+          resolve(res);
+        }, 700);
+      });
+      document.body.appendChild(f);
+    });
+  }
+
+  (async function () {
+    // 先确保已登录（预演账号），否则所有页面都是登录页，检查没意义
+    await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
+      body: JSON.stringify({ nickname: '预演账号', pin: '8888' })
+    });
+    let bad = 0;
+    for (const width of WIDTHS) {
+      lines.push('── 宽 ' + width + 'px ──');
+      for (const [name, hash] of PAGES) {
+        const r = await probe(width, hash);
+        if (r.error) { lines.push('  ?  ' + name + ' 测量失败 ' + r.error); bad++; continue; }
+        if (r.overflow > 1) {
+          bad++;
+          lines.push('  ✗  ' + name + ' 横向溢出 ' + r.overflow + 'px  ← ' + r.culprits.join(' | '));
+        } else {
+          lines.push('  ✓  ' + name + ' 无溢出');
+        }
+      }
+    }
+    lines.unshift(bad === 0 ? '全部通过：6 种宽度 × 6 个页面都没有横向溢出'
+      : '有 ' + bad + ' 处横向溢出，需要修');
+    out.innerHTML = lines.map(function (l) {
+      return esc(l).replace(/^(\s*✗.*)$/, '<span class="bad">$1</span>');
+    }).join('\n');
+    document.title = bad === 0 ? 'OK' : 'FAIL ' + bad;
+  })();
+</script>
+</body>
+</html>

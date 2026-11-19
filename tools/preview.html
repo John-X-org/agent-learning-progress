@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>手机端预演（390px）</title>
+<style>
+  body { margin:0; background:#eef1f6; font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  .bar { padding:10px 14px; font-size:13px; color:#334; }
+  .row { display:flex; gap:14px; padding:0 14px 14px; align-items:flex-start; }
+  .cell { background:#fff; border-radius:14px; box-shadow:0 4px 18px rgba(20,30,60,.12); overflow:hidden; }
+  .cap { font-size:12px; color:#556; padding:6px 10px; background:#f7f9fc; border-bottom:1px solid #e6ebf2; }
+  iframe { width:var(--w, 390px); height:var(--h, 800px); border:0; display:block; }
+  /* 单帧模式：只留一个干净的 iframe，用于输出公众号配图 */
+  body.single .bar, body.single .cap { display:none; }
+  body.single .row { padding:0; }
+  body.single .cell { border-radius:0; box-shadow:none; }
+</style>
+</head>
+<body>
+<div class="bar" id="bar">正在用演示账号登录…</div>
+<div class="row" id="row"></div>
+<script>
+  // 用演示账号登录一次，让同源 iframe 里带上会话 cookie，然后并排铺三个手机屏
+  const NICK = '预演账号';
+  const PIN = '8888';
+  const SETS = {
+    '1': [['看板', '#dashboard'], ['课程列表', '#courses'], ['单元阅读器', '#lesson/L8']],
+    '2': [['三层笔记', '#notes'], ['拆解队列', '#queue'], ['周复盘', '#review']],
+    '3': [['L2 顶部', '#lesson/L2', 0], ['L2 自测区', '#lesson/L2', 1500], ['L2 追问与提示', '#lesson/L2', 2600]],
+    '4': [['L2 分级提示', '#lesson/L2', 3600], ['L2 页面底部', '#lesson/L2', 99999]],
+    '5': [['L3 自测结果（自动选 B）', '#lesson/L3', 99999, 1]],
+    '6': [['L4 滚到中间后点「标记已读」', '#lesson/L4', 1800, null, 'read']]
+  };
+  const q = new URLSearchParams(location.search);
+  // one=<hash> 单帧模式：只渲染一个满幅 iframe，不带外框，供截图输出
+  let SCREENS;
+  if (q.get('one') != null) {
+    document.body.className = 'single';
+    var sc = q.get('scroll');
+    var qp = q.get('quiz');
+    SCREENS = [[q.get('one'), q.get('one'), sc != null ? Number(sc) : 0,
+      qp != null ? Number(qp) : null]];
+  } else {
+    SCREENS = SETS[q.get('set') || '1'];
+  }
+  document.documentElement.style.setProperty('--h', (q.get('h') || 800) + 'px');
+  document.documentElement.style.setProperty('--w', (q.get('w') || 390) + 'px');
+
+  function frame(caption, hash, scroll, quizPick, action) {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    cell.innerHTML = '<div class="cap">' + caption + '</div>';
+    const f = document.createElement('iframe');
+    f.src = '/?preview=1' + hash;
+    f.addEventListener('load', function () {
+      if (quizPick != null) {
+        // 自动答题：每道题都选同一位置的选项，然后提交，用来核对对错配色
+        // 每次选择后界面会重渲染，所以每步都重新查询，不能拿旧的 NodeList 连点
+        var step = 0;
+        setTimeout(function tick() {
+          var doc = f.contentDocument;
+          var total = doc.querySelectorAll('.quiz-q').length;
+          if (step < total) {
+            var opts = doc.querySelectorAll('.quiz-q')[step].querySelectorAll('.opt');
+            if (opts[quizPick]) opts[quizPick].click();
+            step++;
+            setTimeout(tick, 250);
+            return;
+          }
+          var s = doc.querySelector('[data-act="quiz-submit"]');
+          if (s) s.click();
+          setTimeout(function () {
+            var box = doc.querySelector('#quizBox');
+            if (box) box.scrollIntoView({ block: 'start' });
+          }, 900);
+        }, 900);
+        return;
+      }
+      const sy = Number(scroll != null ? scroll : (q.get('scroll') || 0));
+      if (!sy) return;
+      setTimeout(function () {
+        try {
+          const doc = f.contentDocument;
+          const box = doc.querySelector('.reader') || doc.scrollingElement;
+          box.scrollTop = sy;
+          if (action === 'read') {
+            // 滚到中间再点「标记已读」，用来看重渲染之后滚动位置有没有跳回顶部
+            setTimeout(function () {
+              const b = doc.querySelector('[data-act="mark-read"]');
+              if (b) b.click();
+            }, 400);
+          }
+        } catch (e) { /* ignore */ }
+      }, 700);
+    });
+    cell.appendChild(f);
+    return cell;
+  }
+  function boot() {
+    if (q.get('go')) { location.replace('/#' + q.get('go')); return; }
+    const row = document.getElementById('row');
+    SCREENS.forEach(function (s) { row.appendChild(frame(s[0], s[1], s[2], s[3], s[4])); });
+    document.title = '预演就绪';
+  }
+  if (q.get('nologin') != null) {
+    // 拍登录页用：不登录，iframe 里自然落到登录界面
+    document.getElementById('bar').style.display = 'none';
+    boot();
+  } else {
+    fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ nickname: NICK, pin: PIN })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      document.getElementById('bar').textContent =
+        '演示账号：' + NICK + '（' + (j.created ? '本次新建' : '已存在') + '）　预览宽度 ' + (q.get('w') || 390) + 'px';
+      boot();
+    }).catch(function (e) {
+      document.getElementById('bar').textContent = '登录失败：' + e.message;
+    });
+  }
+</script>
+</body>
+</html>

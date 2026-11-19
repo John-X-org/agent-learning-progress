@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>shots-check</title>
+<style>body{margin:0;font:13px/1.6 ui-monospace,Consolas,monospace;background:#fff;color:#111}pre{white-space:pre-wrap;padding:12px}</style></head>
+<body>
+<pre id="out">检查中…</pre>
+<script>
+  // 对每个目标截图：在精确宽度的 iframe 里打开对应页面，检查关键元素是否存在 + 是否横向溢出
+  const NOLOGIN = new URLSearchParams(location.search).get('nologin') != null;
+
+  const CHECKS = [
+    ['s01 登录页', '#dashboard', 390, 844, '.login-card', 1, true],
+    ['s02 手机看板', '#dashboard', 390, 844, '.total-card', 1],
+    ['s03 手机课程列表', '#courses', 390, 844, '.unit', 14],
+    ['s04 手机阅读器顶部', '#lesson/L8', 390, 844, '.essence', 1],
+    ['s05 手机阅读器机制', '#lesson/L2', 390, 844, '.point', 1, false, 900],
+    ['s06 手机阅读器自测题', '#lesson/L2', 390, 844, '.opt', 9, false, 1500],
+    ['s07 手机阅读器自测结果', '#lesson/L3', 390, 844, '.opt.right', 1, false, 0, true],
+    ['s08 手机阅读器提示', '#lesson/L2', 390, 844, '.hint-tier', 1, false, 3600],
+    ['s09 手机笔记', '#notes', 390, 844, '.note-body', 3],
+    ['s10 手机队列', '#queue', 390, 844, '.stuck-text', 1],
+    ['s11 手机复盘', '#review', 390, 844, '.review-sentence', 1],
+    ['s12 手机阅读器底部', '#lesson/L4', 390, 844, '.reader-foot', 1, false, 99999],
+    ['s13 窄屏看板', '#dashboard', 320, 700, '.total-card', 1],
+    ['s14 窄屏课程列表', '#courses', 320, 700, '.unit', 14]
+  ];
+
+  const out = document.getElementById('out');
+  const lines = [];
+
+  function load(w, h, hash) {
+    return new Promise(function (resolve) {
+      const f = document.createElement('iframe');
+      f.style.cssText = 'position:absolute;left:-9999px;top:0;width:' + w + 'px;height:' + h + 'px;border:0';
+      f.src = '/?shots=1' + hash;
+      f.addEventListener('load', function () {
+        setTimeout(function () { resolve({ f: f, ok: true }); }, 900);
+      });
+      document.body.appendChild(f);
+    });
+  }
+
+  async function check([name, hash, w, h, sel, min, nologin, scroll, quiz]) {
+    if (!!nologin !== NOLOGIN) { lines.push('SKIP ' + name); return; }
+    const { f } = await load(w, h, hash);
+    try {
+      const d = f.contentDocument, iw = f.contentWindow.innerWidth;
+      if (quiz) {
+        // 自动每题选 B 再提交（每次选择会重渲染，逐步重新查询）
+        const total = d.querySelectorAll('.quiz-q').length;
+        for (let i = 0; i < total; i++) {
+          const opts = d.querySelectorAll('.quiz-q')[i].querySelectorAll('.opt');
+          if (opts[1]) opts[1].click();
+          await new Promise(function (r) { setTimeout(r, 250); });
+        }
+        const s = d.querySelector('[data-act="quiz-submit"]');
+        if (s) s.click();
+        await new Promise(function (r) { setTimeout(r, 1200); });
+      }
+      if (scroll) {
+        const box = d.querySelector('.reader') || d.scrollingElement;
+        box.scrollTop = scroll;
+        await new Promise(function (r) { setTimeout(r, 300); });
+      }
+      const count = d.querySelectorAll(sel).length;
+      const overflow = d.documentElement.scrollWidth - iw;
+      const good = count >= min && overflow <= 1;
+      lines.push((good ? 'PASS ' : 'FAIL ') + name + '  sel=' + sel + ' 有 ' + count + '/' + min +
+        '  溢出 ' + overflow + 'px');
+    } catch (e) {
+      lines.push('FAIL ' + name + ' 异常 ' + e.message);
+    }
+    f.remove();
+  }
+
+  (async function () {
+    if (!NOLOGIN) {
+      await fetch('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
+        body: JSON.stringify({ nickname: '预演账号', pin: '8888' })
+      });
+    }
+    for (const c of CHECKS) { await check(c); }
+    let bad = 0;
+    lines.forEach(function (l) { if (l.indexOf('FAIL') === 0) bad++; });
+    lines.unshift(bad === 0 ? 'ALL-PASS 共 ' + lines.length + ' 项' : 'HAS-FAIL ' + bad);
+    out.textContent = lines.join('\n');
+  })();
+</script>
+</body>
+</html>
