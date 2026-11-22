@@ -107,7 +107,11 @@
         return request('/api/tasks/' + id + '/progress', { method: 'POST', body: patch });
       },
       /** 旧版数据迁移：移除无课程任务，补齐 14 个课程单元任务 */
-      migrate: function () { return request('/api/migrate', { method: 'POST' }); }
+      migrate: function () { return request('/api/migrate', { method: 'POST' }); },
+      /** 间隔复测：记录一次回测成绩，服务端排下一次复测日 */
+      review: function (id, payload) {
+        return request('/api/tasks/' + id + '/review', { method: 'POST', body: payload });
+      }
     },
 
     /* ---------- 笔记 ---------- */
@@ -143,8 +147,13 @@
       get: function () { return request('/api/dashboard'); }
     },
 
-    /* ---------- 备份导出 ---------- */
-    exportUrl: '/api/export'
+    /* ---------- 备份：导出 / 导入 ---------- */
+    exportUrl: '/api/export',
+    backup: {
+      import: function (payload) {
+        return request('/api/backup/import', { method: 'POST', body: payload });
+      }
+    }
   };
 
   window.API = API;

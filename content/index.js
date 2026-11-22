@@ -21,7 +21,13 @@ const lessons = [].concat(
 // 计入"已跑通案例数"的单元
 const CASE_IDS = ['L5', 'L6', 'L7', 'L12'];
 
-const byId = {};
-lessons.forEach((l) => { byId[l.id] = l; });
+// 正文审校状态挂在每个单元上（唯一事实源在 review.js）
+const REVIEW = require('./review');
 
-module.exports = { STAGES, lessons, byId, CASE_IDS };
+const byId = {};
+lessons.forEach((l) => {
+  l.review = REVIEW[l.id] || { level: 'none', at: null, by: null, pending: [] };
+  byId[l.id] = l;
+});
+
+module.exports = { STAGES, lessons, byId, CASE_IDS, REVIEW };

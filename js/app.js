@@ -103,8 +103,18 @@
         '</div>' +
       '</div>';
     var mask = root.firstElementChild;
+    var sheet = mask.querySelector('.sheet');
+    // 只有「点遮罩空白处」或「点弹层内明确标了 data-close 的元素」才关闭。
+    // 旧写法 e.target.closest('[data-close]') 会从弹层内部一路冒泡到遮罩自身的 data-close，
+    // 结果点输入框/下拉/标题/空白处全会把弹层关掉（打卡弹层"点哪都关"的根因）。
     mask.addEventListener('click', function (e) {
-      if (e.target.closest('[data-close]') && !e.target.closest('.sheet [data-keep]')) closeSheet();
+      if (sheet && sheet.contains(e.target)) {
+        // 只认弹层内部自己带的 data-close（✕、取消）；遮罩的 data-close 不算
+        var closer = e.target.closest('[data-close]');
+        if (closer && sheet.contains(closer) && !closer.closest('[data-keep]')) closeSheet();
+        return;
+      }
+      closeSheet();
     });
     if (opts.onMount) opts.onMount(mask);
     return mask;
@@ -153,6 +163,8 @@
     try {
       var res = await API.auth.login(nick, pin);
       State.me = res.user;
+      // 云端副本的 key 由「昵称 + PIN」派生：只知昵称算不出来，也就读不到别人的进度
+      try { localStorage.setItem(UK_KEY, await sha256Hex('alp:' + nick + ':' + pin)); } catch (e) { /* 隐私模式 */ }
       await enterApp();
       if (res.created) toast('已建好档案，从第一课开始');
     } catch (err) {
@@ -185,6 +197,7 @@
     }
     renderAll();
     routeFromHash();
+    cloudAutoRestore();   // 服务器空 + 云端有备份 → 自动拉回来（不阻塞界面）
   }
 
   async function loadCurriculum() {
@@ -211,7 +224,242 @@
     State.dash = res[4];
     State.lessonTask = {};
     State.tasks.forEach(function (t) { if (t.lessonId) State.lessonTask[t.lessonId] = t; });
+    saveLocalSnapshot();
+    cloudPush();          // 本机快照之后，再往云端存一份（防抖 2.5 秒）
   }
+
+  /* ================= 本机快照：服务器数据被重置时的兜底 =================
+     服务端只有一台机器一份磁盘，重新发布/换环境都可能把数据清掉。
+     每次加载成功后在本机留一份最近的完整进度，服务端空了就能一键搬回去。 */
+
+  var SNAP_PREFIX = 'alp:snap:v1:';
+
+  function saveLocalSnapshot() {
+    if (!State.me || !State.tasks.length) return;
+    var prog = State.tasks.filter(function (t) { return t.readAt || t.quizBest != null; }).length +
+      State.notes.length + State.checkins.length;
+    if (prog === 0) return;   // 空账号不许覆盖已有快照（否则一次误登录就把兜底删了）
+    try {
+      localStorage.setItem(SNAP_PREFIX + State.me.id, JSON.stringify({
+        at: new Date().toISOString(),
+        userId: State.me.id,
+        nickname: State.me.nickname,
+        tasks: State.tasks, notes: State.notes,
+        checkins: State.checkins, stuck: State.stuck
+      }));
+    } catch (e) { /* 隐私模式 / 配额满：不影响正常使用 */ }
+  }
+
+  function listSnapshots() {
+    var out = [];
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (!k || k.indexOf(SNAP_PREFIX) !== 0) continue;
+        var s = JSON.parse(localStorage.getItem(k) || 'null');
+        if (s && Array.isArray(s.tasks)) out.push(s);
+      }
+    } catch (e) { /* ignore */ }
+    return out;
+  }
+
+  // 优先拿当前账号自己的；没有就拿这台设备上最近的一份（服务端重置后账号 id 会变）
+  function readLocalSnapshot() {
+    var all = listSnapshots();
+    if (!all.length) return null;
+    var myId = State.me && State.me.id;
+    if (myId) {
+      for (var i = 0; i < all.length; i++) if (all[i].userId === myId) return all[i];
+    }
+    all.sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+    return all[0];
+  }
+
+  // 快照里"真的有东西"的条数（空任务模板不算）
+  function snapshotProgress(s) {
+    if (!s) return 0;
+    var t = (s.tasks || []).filter(function (x) { return x.readAt || x.quizBest != null; }).length;
+    return t + (s.notes || []).length + (s.checkins || []).length + (s.stuck || []).length;
+  }
+
+  function agoText(iso) {
+    var ms = Date.now() - new Date(iso).getTime();
+    if (isNaN(ms)) return '时间不明';
+    var m = Math.floor(ms / 60000);
+    if (m < 1) return '刚刚';
+    if (m < 60) return m + ' 分钟前';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + ' 小时前';
+    return Math.floor(h / 24) + ' 天前';
+  }
+
+  /* ================= 云端进度副本（WorkBuddy 云服务） =================
+     主数据仍在自建服务器（判定/越权都在服务端），云端按账号存一份完整副本：
+       user_key = sha256('alp:' + 昵称 + ':' + PIN) 的前 32 位
+     —— 光知道昵称算不出这个 key，也就读不到别人的进度。
+     作用：换设备、服务器磁盘被重置时，登录后自动把进度拉回来。 */
+
+  var CLOUD_CFG = {
+    endpoint: 'https://agent-study-checklist.app.workbuddy.host',
+    oauthRelayBaseUrl: 'https://www.workbuddy.cn/v2/as/genie-baas/oauth',
+    publishableKey: 'wbpk_63tEdplszNPHm8IB9ZcOwm_QIOr9S1dsVKdRlQJHbNnYTuQ7F63vRp1'
+  };
+  var UK_KEY = 'alp:uk:v1';
+  var cloudClient = null;
+  var cloudStat = { state: 'idle', at: null, msg: '' };
+  var cloudTimer = null;
+
+  async function sha256Hex(str) {
+    if (!window.crypto || !crypto.subtle) return '';
+    var h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return Array.prototype.map.call(new Uint8Array(h), function (b) {
+      return ('0' + b.toString(16)).slice(-2);
+    }).join('').slice(0, 32);
+  }
+
+  function getCloud() {
+    if (cloudClient) return cloudClient;
+    if (!window.WorkBuddyCloud || !window.WorkBuddyCloud.createWorkBuddyCloud) {
+      cloudStat.state = 'off';
+      cloudStat.msg = '云组件没加载';
+      return null;
+    }
+    try {
+      cloudClient = window.WorkBuddyCloud.createWorkBuddyCloud({
+        endpoint: CLOUD_CFG.endpoint,
+        oauthRelayBaseUrl: CLOUD_CFG.oauthRelayBaseUrl,
+        publishableKey: CLOUD_CFG.publishableKey
+      });
+    } catch (e) {
+      cloudClient = null;
+      cloudStat.state = 'off';
+      cloudStat.msg = '云组件初始化失败';
+    }
+    return cloudClient;
+  }
+
+  function cloudUserKey() {
+    try { return localStorage.getItem(UK_KEY) || ''; } catch (e) { return ''; }
+  }
+
+  function cloudPayload() {
+    return {
+      tasks: State.tasks, notes: State.notes,
+      checkins: State.checkins, stuck: State.stuck,
+      at: new Date().toISOString()
+    };
+  }
+
+  function cloudCount(p) {
+    if (!p) return 0;
+    var t = (p.tasks || []).filter(function (x) { return x.readAt || x.quizBest != null; }).length;
+    return t + (p.notes || []).length + (p.checkins || []).length + (p.stuck || []).length;
+  }
+
+  function cloudPush(force) {
+    var c = getCloud();
+    var uk = cloudUserKey();
+    if (!c || !uk || !State.me) return;
+
+    var doPush = function () {
+      var payload = cloudPayload();
+      c.database.from('progress_cloud').upsert({
+        user_key: uk,
+        nickname: State.me ? State.me.nickname : null,
+        payload: payload,
+        updated_at: payload.at
+      }, { onConflict: 'user_key' }).then(function (r) {
+        if (!r || r.error) {
+          cloudStat.state = 'error';
+          cloudStat.msg = (r && r.error && r.error.message) || '写入失败';
+        } else {
+          cloudStat.state = 'ok';
+          cloudStat.at = payload.at;
+          cloudStat.msg = '';
+        }
+        renderCloudLine();
+      }).catch(function () {
+        cloudStat.state = 'error';
+        cloudStat.msg = '网络不通';
+        renderCloudLine();
+      });
+    };
+
+    if (force) { doPush(); return; }
+    if (cloudTimer) return;
+    cloudTimer = setTimeout(function () { cloudTimer = null; doPush(); }, 2500);
+  }
+
+  function cloudPull() {
+    var c = getCloud();
+    var uk = cloudUserKey();
+    if (!c || !uk) return Promise.resolve(null);
+    return c.database.from('progress_cloud')
+      .select('payload,updated_at,nickname')
+      .eq('user_key', uk)
+      .maybeSingle()
+      .then(function (r) {
+        if (r && !r.error && r.data) {
+          cloudStat.state = 'ok';
+          cloudStat.at = r.data.updated_at;
+          return r.data;
+        }
+        if (r && r.error) {
+          cloudStat.state = 'error';
+          cloudStat.msg = (r.error && r.error.message) || '';
+        }
+        return null;
+      }).catch(function () { return null; });
+  }
+
+  async function cloudRestore(manual) {
+    var row = await cloudPull();
+    if (!row) { if (manual) toast('云端还没有这个账号的备份'); return; }
+    var p = row.payload || {};
+    if (cloudCount(p) === 0) { if (manual) toast('云端备份里没有进度'); return; }
+    if (manual && !confirm('把云端备份合并到当前账号？\n云端时间：' +
+      String(row.updated_at || '').slice(0, 16).replace('T', ' '))) return;
+    try {
+      var res = await API.backup.import(p);
+      await loadAll();
+      renderAll();
+      if (State.reader) renderReader();
+      var cn = res.counts || {};
+      toast('已从云端恢复：进度 ' + ((cn.tasks || 0) + (cn.merged || 0)) +
+        ' 条、笔记 ' + (cn.notes || 0) + ' 条、打卡 ' + (cn.checkins || 0) + ' 天');
+    } catch (e) { toast(e.message || '云端恢复失败'); }
+  }
+
+  // 服务器是空账号、云端却有备份 → 自动拉回来（换设备/服务器被重置时无感恢复）
+  async function cloudAutoRestore() {
+    if (!State.dash || !State.me) return;
+    var d = State.dash;
+    var empty = d.readCount === 0 && d.notesCount === 0 && d.activityTotal === 0;
+    if (!empty) { cloudPush(); return; }
+    var row = await cloudPull();
+    if (!row) return;
+    if (cloudCount(row.payload || {}) === 0) return;
+    try {
+      await API.backup.import(row.payload);
+      await loadAll();
+      renderAll();
+      toast('服务器这边是空的，已自动从云端恢复进度');
+    } catch (e) { /* 静默：不影响正常使用 */ }
+  }
+
+  function cloudStatText() {
+    if (!cloudUserKey()) return '重新登录一次即可启用云端同步';
+    if (cloudStat.state === 'ok') return '已同步' + (cloudStat.at ? ' · ' + agoText(cloudStat.at) : '');
+    if (cloudStat.state === 'error') return '同步失败' + (cloudStat.msg ? '（' + cloudStat.msg + '）' : '');
+    if (cloudStat.state === 'off') return '未连接' + (cloudStat.msg ? '（' + cloudStat.msg + '）' : '');
+    return '还没同步';
+  }
+
+  function renderCloudLine() {
+    var el = document.getElementById('cloudState');
+    if (el) el.textContent = cloudStatText();
+  }
+
 
   function startPolling() {
     stopPolling();
@@ -308,6 +556,42 @@
       '</div>';
     }
 
+    // 该回测了（间隔复习：学完 3 天 / 7 天 / 21 天 / 60 天各回测一次）
+    var rc = $('#reviewCard');
+    if (rc) {
+      var snap = readLocalSnapshot();
+      var looksEmpty = d.readCount === 0 && d.notesCount === 0 && d.activityTotal === 0;
+      if (snap && looksEmpty && snapshotProgress(snap) > 0) {
+        // 账号是空的，但本机存过一份进度：八成是服务端被重置了
+        rc.innerHTML = '<div class="card review-due">' +
+          '<div class="card-head"><h2>本机有进度快照</h2>' +
+            '<span class="muted small">' + esc(agoText(snap.at)) + '</span></div>' +
+          '<p class="small">这台设备存过一份进度（' + snapshotProgress(snap) + ' 条记录），当前账号却是空的——服务端数据可能被重置了。</p>' +
+          '<button class="btn btn-primary" data-act="local-restore" type="button">恢复到当前账号</button>' +
+          '<p class="muted small" style="margin:8px 0 0">快照属于「' + esc(snap.nickname || '未知') + '」，内容是你本机最后一次看到的完整进度。</p>' +
+        '</div>';
+      } else if (!d.dueReviews || !d.dueReviews.length) {
+        rc.innerHTML = '';
+      } else {
+        rc.innerHTML = '<div class="card review-due">' +
+          '<div class="card-head"><h2>该回测了</h2>' +
+            '<span class="muted small">' + d.dueReviews.length + ' 个单元到期</span></div>' +
+          d.dueReviews.map(function (r) {
+            return '<div class="due-row">' +
+              '<div class="due-main"><b>' + esc(r.title) + '</b>' +
+                '<span class="muted small">' +
+                  (r.overdueDays > 0 ? '超期 ' + r.overdueDays + ' 天' : '今天到期') +
+                  (r.lastPct != null ? ' · 上次 ' + r.lastPct + '%'
+                    : ' · 首次 ' + (r.firstPct == null ? '—' : r.firstPct + '%')) +
+                '</span></div>' +
+              '<button class="btn btn-sm btn-primary" data-act="review-lesson" data-id="' + esc(r.lessonId) + '" type="button">回测</button>' +
+            '</div>';
+          }).join('') +
+          '<p class="muted small" style="margin:8px 0 0">复测只记进曲线，不动你的历史最好成绩；间隔按 3 → 7 → 21 → 60 天。</p>' +
+        '</div>';
+      }
+    }
+
     var alert = $('#stuckAlert');
     if (d.overdueStuckCount > 0) {
       alert.hidden = false;
@@ -392,7 +676,7 @@
       total: lesson.quiz.length,
       hints: 0
     };
-    renderReader(opts && opts.scrollToQuiz);
+    renderReader(opts && opts.scrollToQuiz, opts && opts.resetScroll);
   }
 
   function chip(ok, label) {
@@ -451,15 +735,31 @@
     return html;
   }
 
-  function renderReader(scrollToQuiz) {
+  function pendingText(task, lesson) {
+    var miss = [];
+    if (!(task && task.readAt)) miss.push('标记已读');
+    if (!(task && task.quizBest != null && task.quizBest >= 80)) miss.push('自测到 80%');
+    if (lesson.requiresNote && !hasNote(task && task.id)) miss.push('交一条三层笔记');
+    return miss.length ? '还差：' + miss.join('、') : '';
+  }
+
+  function renderReader(scrollToQuiz, resetScroll) {
     var r = State.reader;
     if (!r) return;
     var lesson = State.lessonById[r.lessonId];
     var task = State.lessonTask[r.lessonId] || null;
     var st = unitState(task, lesson);
-    // 重渲染后要把滚动位置放回去，否则点一次按钮页面就跳回顶部
+    // 重渲染后要把滚动位置放回去，否则点一次按钮页面就跳回顶部；换到下一节则回到顶部
     var oldEl = document.getElementById('reader');
-    var keepTop = oldEl ? oldEl.scrollTop : 0;
+    var keepTop = resetScroll ? 0 : (oldEl ? oldEl.scrollTop : 0);
+
+    // 上一节 / 下一节：按 L1→L14 的学习顺序排
+    var idx = -1;
+    for (var i = 0; i < State.lessons.length; i++) {
+      if (State.lessons[i].id === lesson.id) { idx = i; break; }
+    }
+    var nextL = idx >= 0 ? State.lessons[idx + 1] || null : null;
+    var readDone = !!(task && task.readAt);
 
     var body = '';
     body += '<div class="essence">' + md(lesson.essence) + '</div>';
@@ -470,6 +770,33 @@
         '自测' + (task && task.quizBest != null ? ' ' + task.quizBest + '%' : '')) +
       chip(hasNote(task && task.id), lesson.requiresNote ? '笔记（必须）' : '笔记') +
     '</div>';
+
+    // 间隔复测：学完的单元才有复测日
+    if (task && task.status === 'done' && task.reviewDue) {
+      var dueMs = new Date(task.reviewDue).getTime();
+      var overdue = dueMs <= Date.now();
+      var dueTxt = task.reviewDue.slice(5, 10);
+      body += '<p class="review-line' + (overdue ? ' due' : '') + '">' +
+        (overdue ? '⏰ 该回测了（原定 ' + esc(dueTxt) + '）' : '下次回测：' + esc(dueTxt)) +
+        (task.reviewCount ? ' · 已回测 ' + task.reviewCount + ' 次' : '') +
+        (task.reviewLast ? ' · 上次 ' + task.reviewLast.pct + '%' : '') +
+      '</p>';
+    }
+
+    // 正文可信度：机器查过的 ≠ 人核对过的，必须让读者一眼看到差别
+    var rv = lesson.review || { level: 'none', pending: [] };
+    body += '<div class="review-badge ' + (rv.level === 'human' ? 'is-human' : 'is-machine') + '">' +
+      (rv.level === 'human'
+        ? '✓ 已人工核对' + (rv.by ? '（' + esc(rv.by) + '）' : '') + (rv.at ? ' · ' + esc(rv.at) : '')
+        : '⚠ 只过了机器检查（结构/代码语法/答案索引），事实还没人核对' +
+          (rv.pending && rv.pending.length ? ' · ' + rv.pending.length + ' 点待确认' : '')) +
+    '</div>';
+    if (rv.pending && rv.pending.length) {
+      body += '<details class="review-pending"><summary>这节还有 ' + rv.pending.length +
+        ' 点需要人看一眼（点开看清单）</summary><ul>' +
+        rv.pending.map(function (p) { return '<li>' + esc(p) + '</li>'; }).join('') +
+      '</ul></details>';
+    }
 
     body += sec(1, '为什么需要它', '<p class="p">' + md(lesson.why) + '</p>' +
       '<div class="quote" style="margin-top:12px">' + md(lesson.metaphor) + '</div>');
@@ -501,6 +828,17 @@
 
     body += sec(7, '卡住了？一层一层看提示', '<div class="hint-tier" id="hintTier">' + hintHtml(lesson, r) + '</div>');
 
+    // 读到末尾就能直接进下一节，不用先返回课程列表
+    body += '<div class="reader-end">' +
+      (st.key === 'done'
+        ? '<div class="end-done">✓ 这一节学完了，接着往下走</div>'
+        : '<div class="end-pending">' + esc(pendingText(task, lesson) || '这一节还没算学完') + '</div>') +
+      (nextL
+        ? '<button class="btn btn-primary btn-lg" data-act="lesson-next" data-id="' + esc(nextL.id) + '" type="button">下一节：' +
+            esc(nextL.title) + ' ›</button>'
+        : '<button class="btn btn-primary btn-lg" data-act="go-courses" type="button">这是最后一节，回课程列表</button>') +
+    '</div>';
+
     $('#readerRoot').innerHTML =
       '<div class="reader" id="reader">' +
         '<div class="reader-bar">' +
@@ -511,10 +849,15 @@
         '</div>' +
         '<div class="reader-body">' + body + '</div>' +
         '<div class="reader-foot"><div class="inner">' +
-          '<button class="btn ' + (task && task.readAt ? 'btn-ghost' : 'btn-primary') + ' wide" data-act="mark-read" type="button"' +
-            (task && task.readAt ? ' disabled' : '') + '>' + (task && task.readAt ? '已读 ✓' : '标记已读') + '</button>' +
-          '<button class="btn btn-ghost" data-act="lesson-note" type="button">写笔记</button>' +
-          '<button class="btn btn-ghost" data-act="lesson-stuck" type="button">卡住</button>' +
+          (readDone
+            ? '<button class="btn btn-ghost" data-act="lesson-note" type="button">写笔记</button>' +
+              '<button class="btn btn-ghost" data-act="lesson-stuck" type="button">卡住</button>' +
+              (nextL
+                ? '<button class="btn btn-primary wide" data-act="lesson-next" data-id="' + esc(nextL.id) + '" type="button">下一节 ›</button>'
+                : '<button class="btn btn-primary wide" data-act="go-courses" type="button">回课程列表</button>')
+            : '<button class="btn btn-primary wide" data-act="mark-read" type="button">标记已读</button>' +
+              '<button class="btn btn-ghost" data-act="lesson-note" type="button">写笔记</button>' +
+              '<button class="btn btn-ghost" data-act="lesson-stuck" type="button">卡住</button>') +
         '</div></div>' +
       '</div>';
 
@@ -568,6 +911,7 @@
 
     var task = State.lessonTask[r.lessonId];
     if (!task) { toast('这一节缺少任务记录'); return; }
+    var wasDone = task.status === 'done';   // 学完之后再答一遍 = 复测
 
     try {
       var res = await API.tasks.progress(task.id, {
@@ -577,10 +921,25 @@
       });
       r.submitted = true;
       r.score = score;
+      var pct = Math.round((score / lesson.quiz.length) * 100);
+
+      if (wasDone) {
+        // 复测：单独记一条曲线，并顺延下次回测日
+        var gap = 3;
+        try {
+          var rv = await API.tasks.review(task.id, { quizScore: score, quizTotal: lesson.quiz.length });
+          gap = (rv && rv.nextGapDays) || gap;
+        } catch (e) { /* 复测记录失败不影响这次答题结果 */ }
+        await loadAll();
+        renderAll();
+        renderReader();
+        toast('复测 ' + pct + '% · ' + gap + ' 天后再回测');
+        return;
+      }
+
       await loadAll();
       renderAll();
       renderReader();
-      var pct = Math.round((score / lesson.quiz.length) * 100);
       toast(pct >= 80 ? '自测通过 ' + pct + '%' : '得分 ' + pct + '%，看解析再答一次');
       if (res.state && res.state.done) {
         setTimeout(function () { toast('这一节学完了 ✓'); }, 900);
@@ -708,15 +1067,40 @@
     }).join('');
 
     var name = (State.me && State.me.nickname) || '学习者';
+    var ret = d.retention || { count: 0, avgDecay: null };
+    var retTxt;
+    if (!ret.count) retTxt = '还没回测记录';
+    else if (ret.avgDecay <= -1) retTxt = '比首次退步 ' + Math.abs(ret.avgDecay) + ' 分（' + ret.count + ' 个已回测）';
+    else if (ret.avgDecay >= 1) retTxt = '比首次还高 ' + ret.avgDecay + ' 分（' + ret.count + ' 个已回测）';
+    else retTxt = '跟首次持平（' + ret.count + ' 个已回测）';
+
+    var snap = readLocalSnapshot();
+    var snapLine = snap
+      ? '<div class="account-line"><span class="k">本机快照</span><span class="small muted">' +
+          esc(agoText(snap.at)) + ' · ' + snapshotProgress(snap) + ' 条</span></div>'
+      : '<div class="account-line"><span class="k">本机快照</span><span class="small muted">还没有</span></div>';
+
     $('#accountBox').innerHTML =
       '<div class="account-line"><span class="k">昵称</span><span>' + esc(name) + '</span></div>' +
       '<div class="account-line"><span class="k">档案创建</span><span class="small muted">' +
         esc(String((State.me && State.me.createdAt) || '').slice(0, 10)) + '</span></div>' +
+      '<div class="account-line"><span class="k">记忆留存</span><span class="small">' + esc(retTxt) + '</span></div>' +
+      snapLine +
+      '<div class="account-line"><span class="k">云端备份</span><span class="small" id="cloudState">' +
+        esc(cloudStatText()) + '</span></div>' +
       '<div class="actions">' +
         '<button class="btn btn-sm btn-ghost" data-act="edit-nickname" type="button">改昵称</button>' +
         '<a class="btn btn-sm btn-ghost" href="' + API.exportUrl + '" download>导出备份</a>' +
+        '<button class="btn btn-sm btn-ghost" data-act="import-backup" type="button">导入备份</button>' +
+        (snap && snapshotProgress(snap) > 0
+          ? '<button class="btn btn-sm btn-ghost" data-act="local-restore" type="button">用本机快照恢复</button>'
+          : '') +
+        '<button class="btn btn-sm btn-ghost" data-act="cloud-push" type="button">立即备份到云端</button>' +
+        '<button class="btn btn-sm btn-ghost" data-act="cloud-restore" type="button">从云端恢复</button>' +
         '<button class="btn btn-sm btn-ghost" data-act="logout" type="button">退出登录</button>' +
-      '</div>';
+      '</div>' +
+      '<p class="small muted" style="margin:2px 0 0">备份是一个 JSON 文件；本机快照是这台设备自动留的一份。' +
+        '换设备、或者服务端数据被重置后，两者都能把进度搬回来（同一条进度不会重复记）。</p>';
   }
 
   function renderAll() {
@@ -876,6 +1260,32 @@
         });
       }
     });
+  }
+
+  /* ================= 交互：导入备份 ================= */
+
+  async function importBackupFile(file) {
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024) { toast('备份文件太大（超过 4MB）'); return; }
+
+    var text;
+    try { text = await file.text(); } catch (err) { toast('这个文件读不出来'); return; }
+    var payload;
+    try { payload = JSON.parse(text); } catch (err) { toast('不是合法的 JSON 备份文件'); return; }
+
+    toast('正在导入…');
+    try {
+      var res = await API.backup.import(payload);
+      var c = res.counts || {};
+      await loadAll();
+      renderAll();
+      if (State.reader) renderReader();
+      toast('已导入：进度 ' + ((c.tasks || 0) + (c.merged || 0)) + ' 条、笔记 ' + (c.notes || 0) +
+        ' 条、打卡 ' + (c.checkins || 0) + ' 天、卡点 ' + (c.stuck || 0) + ' 条' +
+        (c.skipped ? '（跳过重复 ' + c.skipped + ' 条）' : ''));
+    } catch (err) {
+      toast(err.message || '导入失败');
+    }
   }
 
   /* ================= 交互：打卡 ================= */
@@ -1073,6 +1483,13 @@
     });
     $('#btnCheckin').addEventListener('click', openCheckinSheet);
 
+    var importFile = $('#importFile');
+    if (importFile) {
+      importFile.addEventListener('change', function () {
+        importBackupFile(this.files && this.files[0]);
+      });
+    }
+
     document.addEventListener('click', async function (e) {
       var el = e.target.closest('[data-act]');
       if (!el) return;
@@ -1102,6 +1519,24 @@
         return;
       }
       if (act === 'close-reader') { closeReader(); return; }
+      if (act === 'review-lesson') {
+        if (!id) return;
+        try { history.replaceState(null, '', '#lesson/' + id); } catch (err) { /* ignore */ }
+        openReader(id, { scrollToQuiz: true });
+        return;
+      }
+      if (act === 'lesson-next') {
+        if (!id) { toast('已经是最后一节了'); return; }
+        closeSheet();
+        try { history.replaceState(null, '', '#lesson/' + id); } catch (err) { /* ignore */ }
+        openReader(id, { resetScroll: true });
+        return;
+      }
+      if (act === 'go-courses') {
+        closeReader(true);
+        go('courses');
+        return;
+      }
       if (act === 'mark-read') { markRead(); return; }
       if (act === 'copy') {
         var code = el.getAttribute('data-code') || '';
@@ -1181,6 +1616,38 @@
         return;
       }
       if (act === 'logout') { logout(); return; }
+      if (act === 'local-restore') {
+        var snap = readLocalSnapshot();
+        if (!snap) { toast('这台设备上没有快照了'); return; }
+        if (snap.userId && State.me && snap.userId !== State.me.id &&
+            !confirm('这份快照属于「' + (snap.nickname || '另一个账号') + '」，\n确定把它导入到当前账号吗？')) return;
+        try {
+          var rr = await API.backup.import({
+            tasks: snap.tasks, notes: snap.notes, checkins: snap.checkins, stuck: snap.stuck
+          });
+          await loadAll();
+          renderAll();
+          if (State.reader) renderReader();
+          var cn = rr.counts || {};
+          toast('已从本机快照恢复：进度 ' + ((cn.tasks || 0) + (cn.merged || 0)) +
+            ' 条、笔记 ' + (cn.notes || 0) + ' 条、打卡 ' + (cn.checkins || 0) + ' 天');
+        } catch (e) { toast(e.message || '恢复失败'); }
+        return;
+      }
+      if (act === 'cloud-push') {
+        if (!cloudUserKey()) { toast('重新登录一次才能启用云端同步'); return; }
+        cloudPush(true);
+        setTimeout(function () { toast(cloudStatText()); }, 1200);
+        return;
+      }
+      if (act === 'cloud-restore') { cloudRestore(true); return; }
+      if (act === 'import-backup') {
+        var finp = $('#importFile');
+        if (!finp) { toast('这个浏览器不支持导入，换一个试试'); return; }
+        finp.value = '';
+        finp.click();
+        return;
+      }
     });
 
     document.addEventListener('visibilitychange', function () {

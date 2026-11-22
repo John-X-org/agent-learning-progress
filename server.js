@@ -104,6 +104,9 @@ const STAGES = CONTENT.STAGES;
 const STAGE_NAME = {};
 STAGES.forEach((s) => { STAGE_NAME[s.key] = s.name; });
 
+// 间隔复习的间隔（天）：学完 → 3 天 → 7 天 → 21 天 → 之后一直 60 天
+const REVIEW_GAPS = [3, 7, 21, 60];
+
 /* ============================ 工具 ============================ */
 
 function pad2(n) { return n < 10 ? '0' + n : String(n); }
@@ -205,7 +208,7 @@ function readBody(req) {
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > 512 * 1024) { reject(new Error('请求体过大')); req.destroy(); return; }
+      if (size > 4 * 1024 * 1024) { reject(new Error('请求体过大')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', () => {
@@ -311,6 +314,8 @@ function seedTasks(userId) {
       readAt: null,
       quizBest: null,
       quizTotal: null,
+      reviewDue: null,
+      reviewLog: [],
       completedAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
@@ -491,6 +496,31 @@ function buildDashboard(userId) {
     ? Math.round(scored.reduce((a, t) => a + t.quizBest, 0) / scored.length)
     : null;
 
+  // 到期该回测的单元（学完 + 排了复测日 + 已到期）
+  const nowMs = Date.now();
+  const dueReviews = ordered
+    .filter((t) => t.lessonId && t.status === 'done' && t.reviewDue && new Date(t.reviewDue).getTime() <= nowMs)
+    .sort((a, b) => new Date(a.reviewDue) - new Date(b.reviewDue))
+    .slice(0, 3)
+    .map((t) => ({
+      lessonId: t.lessonId,
+      title: t.title,
+      dueAt: t.reviewDue,
+      overdueDays: Math.max(0, Math.floor((nowMs - new Date(t.reviewDue).getTime()) / 86400000)),
+      firstPct: t.quizBest,
+      lastPct: Array.isArray(t.reviewLog) && t.reviewLog.length ? t.reviewLog[t.reviewLog.length - 1].pct : null
+    }));
+
+  // 记忆留存：只统计"学过 + 至少回测过一次"的单元，看出还记得多少
+  const reviewed = tasks.filter((t) => Array.isArray(t.reviewLog) && t.reviewLog.length && t.quizBest != null);
+  const retention = {
+    count: reviewed.length,
+    decays: reviewed.map((t) => t.reviewLog[t.reviewLog.length - 1].pct - t.quizBest),
+    avgDecay: reviewed.length
+      ? Math.round(reviewed.reduce((a, t) => a + (t.reviewLog[t.reviewLog.length - 1].pct - t.quizBest), 0) / reviewed.length)
+      : null
+  };
+
   return {
     total,
     done,
@@ -507,6 +537,8 @@ function buildDashboard(userId) {
     quizAvg,
     notesCount: notes.length,
     legacyTasks,
+    dueReviews,
+    retention,
     nextLesson: next ? {
       id: next.id,
       lessonId: next.lessonId || null,
@@ -536,6 +568,10 @@ function recheckLessonDone(userId, t) {
     t.status = 'done';
     t.completedAt = new Date().toISOString();
   }
+  // 学完就排第一次回测（3 天后）；老数据缺这个字段的，这里补上
+  if (done && !t.reviewDue) {
+    t.reviewDue = addDays(new Date(), REVIEW_GAPS[0]).toISOString();
+  }
   return { read: read, quizPassed: quizPassed, needNote: needNote, hasNote: hasNote, done: done };
 }
 
@@ -549,6 +585,11 @@ function taskOut(t) {
     readAt: t.readAt || null,
     quizBest: t.quizBest == null ? null : t.quizBest,
     quizTotal: t.quizTotal == null ? null : t.quizTotal,
+    reviewDue: t.reviewDue || null,
+    reviewCount: Array.isArray(t.reviewLog) ? t.reviewLog.length : 0,
+    reviewLog: Array.isArray(t.reviewLog) ? t.reviewLog.slice(-20) : [],
+    reviewLast: Array.isArray(t.reviewLog) && t.reviewLog.length
+      ? t.reviewLog[t.reviewLog.length - 1] : null,
     requiresNote: !!(lesson && lesson.requiresNote),
     minutes: lesson ? lesson.minutes : null,
     completedAt: t.completedAt, createdAt: t.createdAt, updatedAt: t.updatedAt
@@ -700,6 +741,28 @@ async function handleApi(req, res, pathname, query) {
     return sendJson(res, 200, { item: taskOut(t), saved: true, state });
   }
 
+  /* ---------- 间隔复测：记录一次回测成绩，并排下一次 ---------- */
+  const rm = pathname.match(/^\/api\/tasks\/(\d+)\/review$/);
+  if (rm && method === 'POST') {
+    const t = db.tasks.find((x) => x.id === Number(rm[1]) && x.userId === user.id);
+    if (!t) return sendJson(res, 404, { error: '任务不存在' });
+    const b = await readBody(req);
+    const total = Number(b.quizTotal);
+    const score = Number(b.quizScore);
+    if (!(total > 0) || !(score >= 0)) return sendJson(res, 400, { error: '题目数量不合法' });
+    const pct = Math.max(0, Math.min(100, Math.round((score / total) * 100)));
+    const now = new Date().toISOString();
+    t.reviewLog = Array.isArray(t.reviewLog) ? t.reviewLog : [];
+    t.reviewLog.push({ at: now, pct: pct, score: score, total: total });
+    if (t.reviewLog.length > 20) t.reviewLog = t.reviewLog.slice(-20);
+    // 复测只记进曲线，不冲高 quizBest（否则"记忆衰减"永远看不出来）
+    const gap = REVIEW_GAPS[Math.min(t.reviewLog.length, REVIEW_GAPS.length - 1)];
+    t.reviewDue = addDays(new Date(), gap).toISOString();
+    t.updatedAt = now;
+    persist();
+    return sendJson(res, 200, { item: taskOut(t), saved: true, nextGapDays: gap });
+  }
+
   let m = pathname.match(/^\/api\/tasks\/(\d+)$/);
   if (m) {
     const t = db.tasks.find((x) => x.id === Number(m[1]) && x.userId === user.id);
@@ -722,6 +785,9 @@ async function handleApi(req, res, pathname, query) {
         }
         t.status = b.status;
         if (b.status === 'done' && !t.completedAt) t.completedAt = new Date().toISOString();
+        if (b.status === 'done' && !t.reviewDue) {
+          t.reviewDue = addDays(new Date(), REVIEW_GAPS[0]).toISOString();
+        }
         if (b.status !== 'done') t.completedAt = null;
       }
       t.updatedAt = new Date().toISOString();
@@ -753,6 +819,7 @@ async function handleApi(req, res, pathname, query) {
         stage: t.stage, module: t.module, title: t.title, kind: t.kind,
         status: 'todo', sortOrder: i,
         readAt: null, quizBest: null, quizTotal: null,
+        reviewDue: null, reviewLog: [],
         completedAt: null, createdAt: now, updatedAt: now
       });
       added++;
@@ -924,12 +991,140 @@ async function handleApi(req, res, pathname, query) {
     return sendJson(res, 200, buildDashboard(user.id));
   }
 
+  /* ---------- 备份导入：重新发布后把进度搬回来 ---------- */
+  if (pathname === '/api/backup/import' && method === 'POST') {
+    const body = await readBody(req);
+    const srcTasks = Array.isArray(body.tasks) ? body.tasks : [];
+    const srcNotes = Array.isArray(body.notes) ? body.notes : [];
+    const srcCheckins = Array.isArray(body.checkins) ? body.checkins : [];
+    const srcStuck = Array.isArray(body.stuck) ? body.stuck : [];
+    if (!srcTasks.length && !srcNotes.length && !srcCheckins.length && !srcStuck.length) {
+      return sendJson(res, 400, { error: '这不是本应用的备份文件（没有 tasks/notes/checkins/stuck 数据）' });
+    }
+
+    const now = new Date().toISOString();
+    const counts = { tasks: 0, merged: 0, notes: 0, checkins: 0, stuck: 0, skipped: 0 };
+    const mine = ownedTasks(user.id);
+    const byLesson = new Map();
+    mine.forEach((t) => { if (t.lessonId) byLesson.set(t.lessonId, t); });
+    const idMap = new Map(); // 备份里的任务 id → 当前账号下的任务 id
+
+    // 1) 任务：按 lessonId 合并（进度只进不退），缺失的补建
+    srcTasks.forEach((src) => {
+      const lesson = src.lessonId ? LESSON_BY_ID[src.lessonId] : null;
+      if (!lesson) { counts.skipped++; return; }
+      let t = byLesson.get(lesson.id);
+      if (t) {
+        if (src.readAt && !t.readAt) t.readAt = src.readAt;
+        if (typeof src.quizBest === 'number' && (t.quizBest == null || src.quizBest > t.quizBest)) {
+          t.quizBest = src.quizBest;
+          if (typeof src.quizTotal === 'number') t.quizTotal = src.quizTotal;
+        }
+        // 复测曲线也搬回来（按「时间 + 分数」去重，重复导入不会翻倍）
+        if (Array.isArray(src.reviewLog) && src.reviewLog.length) {
+          t.reviewLog = Array.isArray(t.reviewLog) ? t.reviewLog : [];
+          const seenLog = new Set(t.reviewLog.map((r) => String(r.at) + '|' + r.pct));
+          src.reviewLog.forEach((r) => {
+            const k = String(r.at) + '|' + r.pct;
+            if (!seenLog.has(k)) { t.reviewLog.push(r); seenLog.add(k); }
+          });
+          t.reviewLog.sort((a, b) => new Date(a.at) - new Date(b.at));
+        }
+        if (src.reviewDue && !t.reviewDue) t.reviewDue = src.reviewDue;
+        t.updatedAt = now;
+        counts.merged++;
+      } else {
+        t = {
+          id: nextId(), userId: user.id, lessonId: lesson.id,
+          stage: lesson.stage, module: lesson.module, title: lesson.title,
+          kind: CONTENT.CASE_IDS.indexOf(lesson.id) >= 0 ? 'case' : 'task',
+          status: 'todo', sortOrder: mine.length + counts.tasks,
+          readAt: src.readAt || null,
+          quizBest: typeof src.quizBest === 'number' ? src.quizBest : null,
+          quizTotal: typeof src.quizTotal === 'number' ? src.quizTotal : null,
+          reviewDue: src.reviewDue || null,
+          reviewLog: Array.isArray(src.reviewLog) ? src.reviewLog.slice(-20) : [],
+          completedAt: null, createdAt: src.createdAt || now, updatedAt: now
+        };
+        db.tasks.push(t);
+        byLesson.set(lesson.id, t);
+        counts.tasks++;
+      }
+      if (src.id != null) idMap.set(String(src.id), t.id);
+    });
+
+    // 2) 笔记（标题 + 关联单元去重，taskId 重映射）
+    const noteKeys = new Set(ownedNotes(user.id).map((n) => n.title + '\u0000' + (n.taskId == null ? '' : n.taskId)));
+    srcNotes.forEach((src) => {
+      const title = String(src.title || '').trim();
+      if (!title) { counts.skipped++; return; }
+      const mapped = src.taskId != null && idMap.has(String(src.taskId)) ? idMap.get(String(src.taskId)) : null;
+      const key = title + '\u0000' + (mapped == null ? '' : mapped);
+      if (noteKeys.has(key)) { counts.skipped++; return; }
+      db.notes.push({
+        id: nextId(), userId: user.id, taskId: mapped,
+        stage: STAGE_NAME[src.stage] ? src.stage : STAGES[0].key,
+        module: src.module ? String(src.module).trim() : null,
+        title,
+        oldProblem: String(src.oldProblem || ''),
+        mechanism: String(src.mechanism || ''),
+        pitfalls: String(src.pitfalls || ''),
+        createdAt: src.createdAt || now, updatedAt: now
+      });
+      noteKeys.add(key);
+      counts.notes++;
+    });
+
+    // 3) 打卡（一天一条）
+    const days = new Set(ownedCheckins(user.id).map((c) => c.checkinDate));
+    srcCheckins.forEach((src) => {
+      const day = /^\d{4}-\d{2}-\d{2}$/.test(src.checkinDate || '') ? src.checkinDate : null;
+      if (!day || days.has(day)) { counts.skipped++; return; }
+      db.checkins.push({
+        id: nextId(), userId: user.id, checkinDate: day,
+        stage: STAGE_NAME[src.stage] ? src.stage : null,
+        note: src.note ? String(src.note).slice(0, 200) : null,
+        createdAt: src.createdAt || now
+      });
+      days.add(day);
+      counts.checkins++;
+    });
+
+    // 4) 卡点（必须挂得上任务）
+    const stuckKeys = new Set(ownedStuck(user.id).map((s) => s.stuckText + '\u0000' + s.enteredAt));
+    srcStuck.forEach((src) => {
+      const text = String(src.stuckText || '').trim();
+      const mapped = src.taskId != null && idMap.has(String(src.taskId)) ? idMap.get(String(src.taskId)) : null;
+      if (!text || !mapped) { counts.skipped++; return; }
+      const key = text + '\u0000' + (src.enteredAt || '');
+      if (stuckKeys.has(key)) { counts.skipped++; return; }
+      db.stuck.push({
+        id: nextId(), userId: user.id, taskId: mapped, stuckText: text,
+        attempts: String(src.attempts || ''),
+        nextStep: String(src.nextStep || ''),
+        status: src.status === 'closed' ? 'closed' : 'open',
+        enteredAt: src.enteredAt || now,
+        closedAt: src.status === 'closed' ? (src.closedAt || now) : null
+      });
+      stuckKeys.add(key);
+      counts.stuck++;
+    });
+
+    // 5) 按导回来的进度重算「学完」状态
+    db.tasks.filter((t) => t.userId === user.id).forEach((t) => recheckLessonDone(user.id, t));
+
+    persist();
+    return sendJson(res, 200, { ok: true, saved: true, counts });
+  }
+
   /* ---------- 备份 ---------- */
   if (pathname === '/api/export' && method === 'GET') {
     const payload = {
       exportedAt: new Date().toISOString(),
       user: publicUser(user),
-      tasks: ownedTasks(user.id).map(taskOut),
+      tasks: ownedTasks(user.id).map((t) => Object.assign(taskOut(t), {
+        reviewLog: Array.isArray(t.reviewLog) ? t.reviewLog : []
+      })),
       notes: ownedNotes(user.id).map(noteOut),
       checkins: ownedCheckins(user.id).map(checkinOut),
       stuck: ownedStuck(user.id).map(stuckOut)
