@@ -7,6 +7,7 @@
 - 🔗 线上使用：https://agent-study-checklist.app.workbuddy.host/?sharecode=34Y2CNE65B
 - 📖 完整说明：[使用手册.md](使用手册.md)（怎么用 / 开发思路 / 课程来源 / 14 单元总览）
 - 📕 踩坑与铁律：[问题台账与创作铁律.md](问题台账与创作铁律.md)（每个坑 → 根因 → 修法 → 固化成的检查；做新东西前先看第三章）
+- 📋 更新日志：[CHANGELOG.md](CHANGELOG.md)（每次改了什么、为什么改、怎么证明改对了）
 
 ## 学什么
 
